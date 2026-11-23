@@ -226,3 +226,63 @@ test('auth state reports needsSetup only until a password exists', async () => {
     await rm(configDir, { recursive: true, force: true });
   }
 });
+
+test('first-password setup succeeds for exactly one of several concurrent requests', async () => {
+  const { base, configDir, stop } = await startServer();
+  const credentialFile = path.join(configDir, 'credential.json');
+  const post = (route: string, body: Record<string, unknown>) =>
+    fetch(`${base}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  // Sends one setup per password at once, and returns the password that won.
+  const raceSetups = async (passwords: string[]): Promise<string> => {
+    const responses = await Promise.all(
+      passwords.map((password) => post('/api/auth/setup-password', { password })),
+    );
+    const bodies = (await Promise.all(responses.map((response) => response.json()))) as Array<{
+      recoveryKey?: string;
+      error?: string;
+    }>;
+
+    const winners = responses.flatMap((response, index) => (response.status === 200 ? [index] : []));
+    assert.equal(winners.length, 1, `statuses: ${responses.map((response) => response.status).join(' ')}`);
+    const [winner] = winners;
+
+    responses.forEach((response, index) => {
+      if (index === winner) return;
+      assert.equal(response.status, 409);
+      assert.deepEqual(bodies[index], { error: 'A password has already been set.' });
+      assert.deepEqual(response.headers.getSetCookie(), [], 'a refused setup holds no session');
+    });
+
+    // The one session issued is valid, and what is stored is the winner's.
+    const [sessionCookie] = responses[winner].headers.getSetCookie();
+    const state = await fetch(`${base}/api/auth/state`, { headers: { Cookie: sessionCookie.split(';')[0] } });
+    assert.equal(((await state.json()) as { authenticated: boolean }).authenticated, true);
+    assert.equal((await post('/api/auth/login', { password: passwords[winner] })).status, 200);
+    const recovered = await post('/api/auth/recover', {
+      recoveryKey: bodies[winner].recoveryKey,
+      newPassword: `${passwords[winner]}-recovered`,
+    });
+    assert.equal(recovered.status, 200);
+
+    return passwords[winner];
+  };
+
+  try {
+    const first = await raceSetups(Array.from({ length: 6 }, (_, index) => `first-password-${index}`));
+
+    // Removing the credential file reopens setup, again for a single request.
+    await rm(credentialFile);
+    const second = await raceSetups(Array.from({ length: 6 }, (_, index) => `second-password-${index}`));
+
+    assert.equal((await post('/api/auth/login', { password: `${first}-recovered` })).status, 401);
+    assert.equal((await post('/api/auth/login', { password: `${second}-recovered` })).status, 200);
+  } finally {
+    stop();
+    await rm(configDir, { recursive: true, force: true });
+  }
+});

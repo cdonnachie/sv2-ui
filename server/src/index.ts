@@ -331,12 +331,28 @@ app.get('/api/auth/state', async (req, res) => {
   }
 });
 
+let passwordSetupQueue: Promise<void> = Promise.resolve();
+
+/**
+ * Runs first-password setups one at a time. The check that no credential
+ * exists and the write that creates it are separated by two password hashes,
+ * so requests arriving in between would each pass the check, replace the
+ * credential and receive a session. Sessions and attempt counters already
+ * assume a single process, so queueing within it is enough.
+ */
+function runPasswordSetup<T>(setup: () => Promise<T>): Promise<T> {
+  const result = passwordSetupQueue.then(setup, setup);
+  // The queue only orders setups: it carries neither a result nor a failure.
+  passwordSetupQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
 /**
  * POST /api/auth/setup-password - Create the admin password.
  * Only permitted while no password exists; afterwards it always 409s so it
  * cannot be used to take over a configured instance.
  */
-app.post('/api/auth/setup-password', async (req, res) => {
+app.post('/api/auth/setup-password', (req, res) => runPasswordSetup(async () => {
   try {
     const existing = await loadCredential(CREDENTIAL_FILE);
     if (existing) {
@@ -364,7 +380,7 @@ app.post('/api/auth/setup-password', async (req, res) => {
     console.error('Password setup error:', error);
     res.status(500).json({ error: 'Failed to set password' });
   }
-});
+}));
 
 /**
  * POST /api/auth/login - Exchange the password for a session cookie.
