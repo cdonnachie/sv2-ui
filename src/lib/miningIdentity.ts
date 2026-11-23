@@ -40,7 +40,9 @@ export function parseSriIdentity(identity: string): SriIdentityParts {
     const rest = identity.slice('sri/donate/'.length);
     const parts = rest.split('/');
     const pct = parseInt(parts[0], 10);
-    if (!Number.isNaN(pct) && String(pct) === parts[0] && parts.length >= 2) {
+    // Only 1 to 99 is a partial donation, as for the pool. Reading any other
+    // number as a percentage would turn what follows it into a payout address.
+    if (String(pct) === parts[0] && pct >= 1 && pct <= 99 && parts.length >= 2) {
       return { address: parts[1], workerName: parts.slice(2).join('/'), donationPercent: pct };
     }
     return { address: '', workerName: rest, donationPercent: 100 };
@@ -58,12 +60,14 @@ export function buildSriIdentity(address: string, workerName: string, donationPe
   const addr = address.trim();
   const worker = workerName.trim();
 
-  // A worker name beginning with `<pct>/` (e.g. `25/bc1q…`) is reinterpreted by
-  // the SRI parser as a partial-donation identity, letting a malicious worker
-  // label overwrite the payout fields (field injection). Strip slashes ONLY in
-  // that dangerous shape. Every other worker name is preserved verbatim, so
-  // legitimate names like `rig/1` are neither stripped nor silently rewritten.
-  const safeWorker = /^\d{1,2}\//.test(worker) ? worker.replace(/\//g, '') : worker;
+  // A worker name beginning with `<number>/` (e.g. `25/bc1q…`) is reinterpreted
+  // by the SRI parser as a partial-donation identity, letting a malicious worker
+  // label overwrite the payout fields (field injection). The pool reads the
+  // number as an integer, so `+25/` and `007/` count as much as `25/` does.
+  // Strip slashes ONLY in that dangerous shape. Every other worker name is
+  // preserved verbatim, so legitimate names like `rig/1` are neither stripped
+  // nor silently rewritten.
+  const safeWorker = /^[+-]?\d+\//.test(worker) ? worker.replace(/\//g, '') : worker;
 
   if (donationPercent >= 100) {
     return safeWorker ? `sri/donate/${safeWorker}` : 'sri/donate';
@@ -80,9 +84,21 @@ export function buildSriIdentity(address: string, workerName: string, donationPe
   return safeWorker ? `sri/solo/${addr}/${safeWorker}` : `sri/solo/${addr}`;
 }
 
+/**
+ * Rewrites an identity into the form `buildSriIdentity` gives it, as long as
+ * that says the same thing. An identity whose rebuilt form would pay a
+ * different share, to a different address, or under a different worker name is
+ * returned as it is, so that validation still reports what is wrong with it.
+ */
 export function normalizeSriIdentity(identity: string): string {
   const parsed = parseSriIdentity(identity);
-  return buildSriIdentity(parsed.address, parsed.workerName, parsed.donationPercent);
+  const rebuilt = buildSriIdentity(parsed.address, parsed.workerName, parsed.donationPercent);
+  const reparsed = parseSriIdentity(rebuilt);
+  return reparsed.address === parsed.address.trim() &&
+    reparsed.workerName === parsed.workerName.trim() &&
+    reparsed.donationPercent === parsed.donationPercent
+    ? rebuilt
+    : identity;
 }
 
 export function normalizePoolUserIdentity(pool: PoolConfig, miningMode: MiningMode | null): PoolConfig {
@@ -237,36 +253,20 @@ export function getSriIdentityError(identity: string, network: BitcoinNetwork): 
   if (!identity) return 'Username is required';
   if (!isTomlSafeIdentifier(identity)) return 'Username contains characters that are not allowed';
 
-  const { workerName } = parseSriIdentity(identity);
+  const { address, workerName, donationPercent } = parseSriIdentity(identity);
   const workerError = getWorkerNameError(workerName);
   if (workerError) return workerError;
 
   if (identity === 'sri/donate') return null;
 
-  if (identity.startsWith('sri/solo/')) {
-    const { address } = parseSriIdentity(identity);
+  if (identity.startsWith('sri/solo/') || identity.startsWith('sri/donate/')) {
+    if (donationPercent >= 100) {
+      return workerName ? null : 'Worker name is required';
+    }
+
     return isValidBitcoinAddress(address, network)
       ? null
       : getBitcoinAddressError(address, network) || 'Invalid Bitcoin address';
-  }
-
-  if (identity.startsWith('sri/donate/')) {
-    const rest = identity.slice('sri/donate/'.length);
-    const parts = rest.split('/');
-    const pct = parseInt(parts[0], 10);
-    const hasPartialDonation = !Number.isNaN(pct) && String(pct) === parts[0] && parts.length >= 2;
-
-    if (!hasPartialDonation) {
-      return rest.length > 0 ? null : 'Worker name is required';
-    }
-
-    if (pct <= 0 || pct >= 100) {
-      return 'Donation percent must be between 1 and 99';
-    }
-
-    return isValidBitcoinAddress(parts[1], network)
-      ? null
-      : getBitcoinAddressError(parts[1], network) || 'Invalid Bitcoin address';
   }
 
   return 'Enter a Bitcoin payout address, or set donation to 100% to donate the full reward';

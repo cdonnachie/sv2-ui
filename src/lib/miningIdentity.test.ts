@@ -273,6 +273,72 @@ test('normalizeSriIdentity does not silently rewrite a worker name containing "/
   assert.equal(normalizeSriIdentity(identity), identity);
 });
 
+// Worker names an operator could be handed to paste: each starts with something
+// the pool, or this parser before it was narrowed, could read as a percentage.
+const NUMBER_LIKE_PREFIXES = ['25', '-1', '0', '100', '150', '007', '+25', '-0'];
+
+test('a worker name never changes the donation tier or the payout address', () => {
+  for (const prefix of NUMBER_LIKE_PREFIXES) {
+    const worker = `${prefix}/${SECOND_MAINNET_ADDRESS}`;
+
+    // Full donation: the form submits this, then normalizes it on every change.
+    const donated = buildSriIdentity(MAINNET_ADDRESS, worker, 100);
+    assert.equal(normalizeSriIdentity(donated), donated, `${prefix}: normalizing rewrote ${donated}`);
+    assert.deepEqual(
+      { ...parseSriIdentity(donated), workerName: '' },
+      { address: '', workerName: '', donationPercent: 100 },
+      `${prefix}: ${donated}`,
+    );
+    // The pool takes `sri/donate/<a>/<b>` as a share and an address, whatever
+    // this parser thinks, so nothing may follow the worker name.
+    assert.equal(donated.split('/').length, 3, `${prefix}: ${donated}`);
+
+    for (const percent of [0, 25]) {
+      const paid = buildSriIdentity(MAINNET_ADDRESS, worker, percent);
+      const parsed = parseSriIdentity(normalizeSriIdentity(paid));
+      assert.equal(parsed.address, MAINNET_ADDRESS, `${prefix} at ${percent}%: ${paid}`);
+      assert.equal(parsed.donationPercent, percent, `${prefix} at ${percent}%: ${paid}`);
+    }
+  }
+});
+
+test('only 1 to 99 is read as a partial donation', () => {
+  for (const percent of [1, 25, 99]) {
+    assert.deepEqual(parseSriIdentity(`sri/donate/${percent}/${MAINNET_ADDRESS}/worker1`), {
+      address: MAINNET_ADDRESS,
+      workerName: 'worker1',
+      donationPercent: percent,
+    });
+  }
+
+  for (const prefix of ['-1', '0', '100', '150', '007', '+25', '-0', 'NaN']) {
+    assert.deepEqual(
+      parseSriIdentity(`sri/donate/${prefix}/${MAINNET_ADDRESS}`),
+      { address: '', workerName: `${prefix}/${MAINNET_ADDRESS}`, donationPercent: 100 },
+      prefix,
+    );
+  }
+});
+
+test('normalizing an identity never changes its tier, and never makes a rejected one acceptable', () => {
+  for (const prefix of ['-1', '0', '100', '150', '007', '+25', '-0']) {
+    const identity = `sri/donate/${prefix}/${SECOND_MAINNET_ADDRESS}`;
+    assert.equal(normalizeSriIdentity(identity), identity, prefix);
+    assert.match(getSriIdentityError(identity, 'mainnet') ?? '', /worker name must not contain/i, prefix);
+  }
+
+  // Each tier keeps its share, its address and its worker name.
+  for (const identity of [
+    'sri/donate',
+    'sri/donate/worker1',
+    `sri/donate/25/${MAINNET_ADDRESS}/worker1`,
+    `sri/solo/${MAINNET_ADDRESS}/worker1`,
+    `sri/solo/${MAINNET_ADDRESS}`,
+  ]) {
+    assert.equal(normalizeSriIdentity(identity), identity);
+  }
+});
+
 test('getPoolIdentityError (SRI) blocks Continue/Save while the worker name is invalid', () => {
   const pool: PoolConfig = {
     ...SRI_POOL,
