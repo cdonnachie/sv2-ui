@@ -555,6 +555,9 @@ app.post('/api/auth/change-password', (req, res) => withCredentialLock(async () 
       ...updatedCredential,
       recoveryKey: credential.recoveryKey,
     });
+    // Changing the password is how an operator shuts out whoever else holds
+    // a session. Their own stays, so the change does not log them out.
+    sessions.destroyOthers(getSessionToken(req));
 
     res.json({ success: true });
   } catch (error) {

@@ -43,6 +43,13 @@ export class SessionStore {
   destroyAll(): void {
     this.sessions.clear();
   }
+
+  /** Invalidate every session but one, e.g. the one that changed the password. */
+  destroyOthers(token: string | undefined): void {
+    for (const other of this.sessions.keys()) {
+      if (other !== token) this.sessions.delete(other);
+    }
+  }
 }
 
 /** Minimal cookie-header parser; avoids adding the cookie-parser dependency. */

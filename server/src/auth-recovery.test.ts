@@ -385,3 +385,51 @@ test('a recovery key requested during a recovery neither undoes it nor is issued
     await rm(configDir, { recursive: true, force: true });
   }
 });
+
+test('changing the password ends every session but the one that changed it', async () => {
+  const { base, configDir, stop } = await startServer();
+  const post = (route: string, body: Record<string, unknown>, cookie = '') =>
+    fetch(`${base}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify(body),
+    });
+  const sessionCookie = (response: Response) => response.headers.getSetCookie()[0].split(';')[0];
+  const isAuthenticated = async (cookie: string) =>
+    ((await (await fetch(`${base}/api/auth/state`, { headers: { Cookie: cookie } })).json()) as {
+      authenticated: boolean;
+    }).authenticated;
+  try {
+    const setup = await post('/api/auth/setup-password', { password: 'sup3rsecret' });
+    assert.equal(setup.status, 200);
+    const operator = sessionCookie(setup);
+    const intruder = sessionCookie(await post('/api/auth/login', { password: 'sup3rsecret' }));
+    assert.equal(await isAuthenticated(operator), true);
+    assert.equal(await isAuthenticated(intruder), true);
+
+    // A refused change leaves every session alone.
+    const refused = await post(
+      '/api/auth/change-password',
+      { currentPassword: 'not-the-password', newPassword: 'n3wpassword!' },
+      operator,
+    );
+    assert.equal(refused.status, 401);
+    assert.equal(await isAuthenticated(intruder), true);
+
+    const changed = await post(
+      '/api/auth/change-password',
+      { currentPassword: 'sup3rsecret', newPassword: 'n3wpassword!' },
+      operator,
+    );
+    assert.equal(changed.status, 200);
+    assert.equal(await isAuthenticated(operator), true);
+    assert.equal(await isAuthenticated(intruder), false);
+
+    // The ended session cannot be used to keep access.
+    const regenerate = await post('/api/auth/recovery-key/regenerate', { currentPassword: 'n3wpassword!' }, intruder);
+    assert.equal(regenerate.status, 401);
+  } finally {
+    stop();
+    await rm(configDir, { recursive: true, force: true });
+  }
+});

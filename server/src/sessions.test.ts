@@ -23,6 +23,20 @@ test('a session expires after its TTL', () => {
   assert.equal(store.isValid(token), false);
 });
 
+test('destroying the other sessions keeps only the one named', () => {
+  const store = new SessionStore();
+  const kept = store.create();
+  const others = [store.create(), store.create()];
+
+  store.destroyOthers(kept);
+  assert.equal(store.isValid(kept), true);
+  assert.deepEqual(others.map((token) => store.isValid(token)), [false, false]);
+
+  // Without a session of its own, the caller keeps none.
+  store.destroyOthers(undefined);
+  assert.equal(store.isValid(kept), false);
+});
+
 test('the session cookie is HttpOnly and SameSite=Strict', () => {
   const cookie = buildSessionCookie('abc', false);
   assert.match(cookie, /HttpOnly/);
