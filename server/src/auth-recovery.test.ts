@@ -433,3 +433,47 @@ test('changing the password ends every session but the one that changed it', asy
     await rm(configDir, { recursive: true, force: true });
   }
 });
+
+test('a login with the old password leaves no session behind a recovery', async () => {
+  const { base, configDir, stop } = await startServer();
+  const post = (route: string, body: Record<string, unknown>) =>
+    fetch(`${base}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  try {
+    const setup = await post('/api/auth/setup-password', { password: 'sup3rsecret' });
+    assert.equal(setup.status, 200);
+    const { recoveryKey } = (await setup.json()) as { recoveryKey: string };
+
+    const recovering = post('/api/auth/recover', { recoveryKey, newPassword: 'recovered-password' });
+    // Let the recovery start, then keep logging in with the password it is
+    // replacing. A login that read the old credential before the recovery
+    // wrote, and finished verifying after it revoked the sessions, would get
+    // a session that outlives the password it was obtained with.
+    await pause(50);
+    const loggingIn: Array<Promise<Response>> = [];
+    for (let i = 0; i < 30; i += 1) {
+      loggingIn.push(post('/api/auth/login', { password: 'sup3rsecret' }));
+      await pause(10);
+    }
+
+    assert.equal((await recovering).status, 200);
+
+    for (const response of await Promise.all(loggingIn)) {
+      const [cookie] = response.headers.getSetCookie();
+      if (!cookie) continue;
+      const state = await fetch(`${base}/api/auth/state`, { headers: { Cookie: cookie.split(';')[0] } });
+      assert.equal(
+        ((await state.json()) as { authenticated: boolean }).authenticated,
+        false,
+        'a session obtained with the replaced password is still valid',
+      );
+    }
+  } finally {
+    stop();
+    await rm(configDir, { recursive: true, force: true });
+  }
+});

@@ -386,8 +386,12 @@ app.post('/api/auth/setup-password', (req, res) => withCredentialLock(async () =
 
 /**
  * POST /api/auth/login - Exchange the password for a session cookie.
+ *
+ * Runs in the credential queue: a login that verified the password while a
+ * recovery or a password change was replacing it would otherwise be given a
+ * session after those had revoked every session.
  */
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', (req, res) => withCredentialLock(async () => {
   if (isRateLimited(loginAttempts)) {
     res.setHeader('Retry-After', String(Math.ceil(RATE_WINDOW_MS / 1000)));
     return res.status(429).json({ error: 'Too many attempts. Try again later.' });
@@ -415,7 +419,7 @@ app.post('/api/auth/login', async (req, res) => {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Failed to log in' });
   }
-});
+}));
 
 /**
  * POST /api/auth/logout - Invalidate the current session.
