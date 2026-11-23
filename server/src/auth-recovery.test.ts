@@ -286,3 +286,102 @@ test('first-password setup succeeds for exactly one of several concurrent reques
     await rm(configDir, { recursive: true, force: true });
   }
 });
+
+test('a recovery key completes a single password reset, even for requests sent at once', async () => {
+  const { base, configDir, stop } = await startServer();
+  const post = (route: string, body: Record<string, unknown>) =>
+    fetch(`${base}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  try {
+    const setup = await post('/api/auth/setup-password', { password: 'sup3rsecret' });
+    assert.equal(setup.status, 200);
+    const { recoveryKey } = (await setup.json()) as { recoveryKey: string };
+
+    const passwords = ['first-new-password', 'second-new-password', 'third-new-password'];
+    const responses = await Promise.all(
+      passwords.map((newPassword) => post('/api/auth/recover', { recoveryKey, newPassword })),
+    );
+    const bodies = (await Promise.all(responses.map((response) => response.json()))) as Array<{
+      recoveryKey?: string;
+      error?: string;
+    }>;
+
+    const winners = responses.flatMap((response, index) => (response.status === 200 ? [index] : []));
+    assert.equal(winners.length, 1, `statuses: ${responses.map((response) => response.status).join(' ')}`);
+    const [winner] = winners;
+    const loser = winner === 0 ? 1 : 0;
+
+    // The others are refused as if the key were wrong, which by then it is.
+    responses.forEach((response, index) => {
+      if (index === winner) return;
+      assert.equal(response.status, 401);
+      assert.deepEqual(bodies[index], { error: 'Invalid recovery key.' });
+    });
+
+    // What is stored is what the one successful reset set and returned.
+    assert.equal((await post('/api/auth/login', { password: passwords[loser] })).status, 401);
+    assert.equal((await post('/api/auth/login', { password: passwords[winner] })).status, 200);
+    const again = await post('/api/auth/recover', {
+      recoveryKey: bodies[winner].recoveryKey,
+      newPassword: 'fourth-new-password',
+    });
+    assert.equal(again.status, 200);
+  } finally {
+    stop();
+    await rm(configDir, { recursive: true, force: true });
+  }
+});
+
+test('a recovery key requested during a recovery neither undoes it nor is issued', async () => {
+  const { base, configDir, stop } = await startServer();
+  const post = (route: string, body: Record<string, unknown>, cookie = '') =>
+    fetch(`${base}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify(body),
+    });
+  const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  try {
+    const setup = await post('/api/auth/setup-password', { password: 'sup3rsecret' });
+    assert.equal(setup.status, 200);
+    const { recoveryKey } = (await setup.json()) as { recoveryKey: string };
+    const sessionCookie = setup.headers.getSetCookie()[0].split(';')[0];
+
+    const recovering = post('/api/auth/recover', { recoveryKey, newPassword: 'recovered-password' });
+    // Let the recovery start, then keep asking for a new key from the session
+    // it is about to revoke. The requests that arrive while it is still
+    // hashing pass the session check, and must not act once it has finished.
+    await pause(50);
+    const regenerating: Array<Promise<Response>> = [];
+    for (let i = 0; i < 40; i += 1) {
+      regenerating.push(
+        post('/api/auth/recovery-key/regenerate', { currentPassword: 'sup3rsecret' }, sessionCookie),
+      );
+      await pause(10);
+    }
+
+    const recovered = await recovering;
+    assert.equal(recovered.status, 200);
+    const recoveredBody = (await recovered.json()) as { recoveryKey: string };
+
+    for (const response of await Promise.all(regenerating)) {
+      assert.equal(response.status, 401);
+      assert.deepEqual(await response.json(), { error: 'Authentication required' });
+    }
+
+    // The recovered password and the recovery key it came with are the ones stored.
+    assert.equal((await post('/api/auth/login', { password: 'sup3rsecret' })).status, 401);
+    assert.equal((await post('/api/auth/login', { password: 'recovered-password' })).status, 200);
+    const again = await post('/api/auth/recover', {
+      recoveryKey: recoveredBody.recoveryKey,
+      newPassword: 'recovered-again',
+    });
+    assert.equal(again.status, 200);
+  } finally {
+    stop();
+    await rm(configDir, { recursive: true, force: true });
+  }
+});

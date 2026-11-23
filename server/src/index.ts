@@ -331,19 +331,21 @@ app.get('/api/auth/state', async (req, res) => {
   }
 });
 
-let passwordSetupQueue: Promise<void> = Promise.resolve();
+let credentialQueue: Promise<void> = Promise.resolve();
 
 /**
- * Runs first-password setups one at a time. The check that no credential
- * exists and the write that creates it are separated by two password hashes,
- * so requests arriving in between would each pass the check, replace the
- * credential and receive a session. Sessions and attempt counters already
- * assume a single process, so queueing within it is enough.
+ * Runs the requests that read the credential and then act on it one at a
+ * time. Each of them hashes between its read and its write, so two running
+ * together both act on a credential the other is replacing: several
+ * first-password setups all succeed, one recovery key completes two resets,
+ * and a write built on the old credential puts a replaced password back.
+ * Sessions and attempt counters already assume a single process, so queueing
+ * within it is enough.
  */
-function runPasswordSetup<T>(setup: () => Promise<T>): Promise<T> {
-  const result = passwordSetupQueue.then(setup, setup);
-  // The queue only orders setups: it carries neither a result nor a failure.
-  passwordSetupQueue = result.then(() => undefined, () => undefined);
+function withCredentialLock<T>(work: () => Promise<T>): Promise<T> {
+  const result = credentialQueue.then(work, work);
+  // The queue only orders the work: it carries neither a result nor a failure.
+  credentialQueue = result.then(() => undefined, () => undefined);
   return result;
 }
 
@@ -352,7 +354,7 @@ function runPasswordSetup<T>(setup: () => Promise<T>): Promise<T> {
  * Only permitted while no password exists; afterwards it always 409s so it
  * cannot be used to take over a configured instance.
  */
-app.post('/api/auth/setup-password', (req, res) => runPasswordSetup(async () => {
+app.post('/api/auth/setup-password', (req, res) => withCredentialLock(async () => {
   try {
     const existing = await loadCredential(CREDENTIAL_FILE);
     if (existing) {
@@ -434,7 +436,7 @@ app.post('/api/auth/logout', (req, res) => {
  * the same-origin guard and rate-limited. The mining configuration is
  * preserved; only the credential file is rewritten.
  */
-app.post('/api/auth/recover', async (req, res) => {
+app.post('/api/auth/recover', (req, res) => withCredentialLock(async () => {
   if (isRateLimited(recoverAttempts)) {
     res.setHeader('Retry-After', String(Math.ceil(RATE_WINDOW_MS / 1000)));
     return res.status(429).json({ error: 'Too many attempts. Try again later.' });
@@ -474,14 +476,28 @@ app.post('/api/auth/recover', async (req, res) => {
     console.error('Recovery error:', error);
     res.status(500).json({ error: 'Failed to recover account' });
   }
-});
+}));
+
+/**
+ * Whether the session a request arrived with is still valid now that the
+ * request holds the credential lock. The session middleware let it through
+ * before it waited its turn, and a recovery ahead of it revokes every session:
+ * without this, the request would go on to change the recovered credential.
+ */
+function stillHasSession(req: express.Request, res: express.Response): boolean {
+  if (sessions.isValid(getSessionToken(req))) return true;
+  res.status(401).json({ error: 'Authentication required' });
+  return false;
+}
 
 /**
  * POST /api/auth/recovery-key/regenerate - Issue a new recovery key
  * (authenticated). The prior key is invalidated. The new key is returned once.
  */
-app.post('/api/auth/recovery-key/regenerate', async (_req, res) => {
+app.post('/api/auth/recovery-key/regenerate', (req, res) => withCredentialLock(async () => {
   try {
+    if (!stillHasSession(req, res)) return;
+
     const credential = await loadCredential(CREDENTIAL_FILE);
     if (!credential) {
       return res.status(409).json({ error: 'No password has been set yet.' });
@@ -500,15 +516,17 @@ app.post('/api/auth/recovery-key/regenerate', async (_req, res) => {
     console.error('Regenerate recovery key error:', error);
     res.status(500).json({ error: 'Failed to regenerate recovery key' });
   }
-});
+}));
 
 /**
  * POST /api/auth/change-password - Change the admin password (authenticated).
  * Requires the current password and a new password that meets the minimum
  * length requirement. The recovery key is preserved.
  */
-app.post('/api/auth/change-password', async (req, res) => {
+app.post('/api/auth/change-password', (req, res) => withCredentialLock(async () => {
   try {
+    if (!stillHasSession(req, res)) return;
+
     const { currentPassword, newPassword } = req.body as {
       currentPassword?: string;
       newPassword?: string;
@@ -546,7 +564,7 @@ app.post('/api/auth/change-password', async (req, res) => {
     console.error('Change password error:', error);
     res.status(500).json({ error: 'Failed to change password' });
   }
-});
+}));
 
 async function getCurrentStatus(): Promise<StatusResponse> {
   const state = await loadState();
