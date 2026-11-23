@@ -59,6 +59,7 @@ import { getLogDiagnostics, getLogStreams, readCollatedLogLines } from './logs/d
 import { evaluateDiagnosisPolicy } from './logs/parsers.js';
 import type { DiagnosisRetryDecision } from './logs/parsers.js';
 import { ActivePoolTracker } from './active-pool.js';
+import { AttemptLimiter, clientKey } from './attempt-limiter.js';
 import { isDegraded, isOnlyTranslatorStopped, isStackRunning } from './stack-health.js';
 import { AutoStartReconciler } from './auto-start.js';
 import { TranslatorRecovery } from './translator-recovery.js';
@@ -164,26 +165,20 @@ const PUBLIC_API_PATHS = new Set([
 const RATE_MAX_FAILURES = 5;
 const RATE_WINDOW_MS = 15 * 60 * 1000;
 
-const loginAttempts = { count: 0, resetAt: 0 };
-const recoverAttempts = { count: 0, resetAt: 0 };
+const loginAttempts = new AttemptLimiter(RATE_MAX_FAILURES, RATE_WINDOW_MS);
+const recoverAttempts = new AttemptLimiter(RATE_MAX_FAILURES, RATE_WINDOW_MS);
 
-function isRateLimited(attempts: { count: number; resetAt: number }): boolean {
-  if (attempts.count === 0) return false;
-  if (Date.now() > attempts.resetAt) {
-    attempts.count = 0;
-    return false;
-  }
-  return attempts.count >= RATE_MAX_FAILURES;
-}
-
-function recordFailure(attempts: { count: number; resetAt: number }): void {
-  const now = Date.now();
-  if (attempts.count === 0 || now > attempts.resetAt) {
-    attempts.count = 1;
-    attempts.resetAt = now + RATE_WINDOW_MS;
-  } else {
-    attempts.count += 1;
-  }
+/**
+ * Takes an attempt from the budget of the client behind a request, or returns
+ * null when that client has none left.
+ *
+ * The client is the TCP peer, not `req.ip`: with `trust proxy` on, `req.ip`
+ * is whatever X-Forwarded-For claims, so a client could give itself a fresh
+ * budget on every request. Behind a reverse proxy every client therefore
+ * shares the proxy's budget.
+ */
+function admitAttempt(attempts: AttemptLimiter, req: express.Request): (() => void) | null {
+  return attempts.admit(clientKey(req.socket.remoteAddress));
 }
 
 function isSecureRequest(req: express.Request): boolean {
@@ -370,7 +365,10 @@ app.post('/api/auth/setup-password', async (req, res) => {
  * POST /api/auth/login - Exchange the password for a session cookie.
  */
 app.post('/api/auth/login', async (req, res) => {
-  if (isRateLimited(loginAttempts)) {
+  // Taken before the first await, so requests arriving together cannot all
+  // be admitted. It is given back only where no wrong guess was made.
+  const giveAttemptBack = admitAttempt(loginAttempts, req);
+  if (!giveAttemptBack) {
     res.setHeader('Retry-After', String(Math.ceil(RATE_WINDOW_MS / 1000)));
     return res.status(429).json({ error: 'Too many attempts. Try again later.' });
   }
@@ -378,15 +376,16 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const credential = await loadCredential(CREDENTIAL_FILE);
     if (!credential) {
+      giveAttemptBack();
       return res.status(409).json({ error: 'No password has been set yet.' });
     }
 
     const password = isJsonObject(req.body) ? req.body.password : undefined;
     if (typeof password !== 'string' || !(await verifyPassword(password, credential))) {
-      recordFailure(loginAttempts);
       return res.status(401).json({ error: 'Incorrect password.' });
     }
 
+    giveAttemptBack();
     const token = sessions.create();
     res.setHeader('Set-Cookie', buildSessionCookie(token, isSecureRequest(req)));
     res.json({ success: true });
@@ -419,7 +418,10 @@ app.post('/api/auth/logout', (req, res) => {
  * preserved; only the credential file is rewritten.
  */
 app.post('/api/auth/recover', async (req, res) => {
-  if (isRateLimited(recoverAttempts)) {
+  // Taken before the first await, so requests arriving together cannot all
+  // be admitted. It is given back only where no wrong guess was made.
+  const giveAttemptBack = admitAttempt(recoverAttempts, req);
+  if (!giveAttemptBack) {
     res.setHeader('Retry-After', String(Math.ceil(RATE_WINDOW_MS / 1000)));
     return res.status(429).json({ error: 'Too many attempts. Try again later.' });
   }
@@ -427,22 +429,24 @@ app.post('/api/auth/recover', async (req, res) => {
   try {
     const recoveryKey = isJsonObject(req.body) ? req.body.recoveryKey : undefined;
     if (typeof recoveryKey !== 'string' || recoveryKey.length === 0) {
+      giveAttemptBack();
       return res.status(400).json({ error: 'A recovery key is required.' });
     }
 
     const newPassword = isJsonObject(req.body) ? req.body.newPassword : undefined;
     const passwordError = getPasswordValidationError(newPassword);
     if (passwordError) {
+      giveAttemptBack();
       return res.status(400).json({ error: passwordError });
     }
 
     const credential = await loadCredential(CREDENTIAL_FILE);
     if (!credential) {
+      giveAttemptBack();
       return res.status(409).json({ error: 'No password has been set yet.' });
     }
 
     if (!(await verifyRecoveryKey(recoveryKey, credential))) {
-      recordFailure(recoverAttempts);
       return res.status(401).json({ error: 'Invalid recovery key.' });
     }
 
@@ -452,7 +456,7 @@ app.post('/api/auth/recover', async (req, res) => {
       recoveryKey: await hashPassword(newRecoveryKey),
     });
     sessions.destroyAll();
-    recoverAttempts.count = 0;
+    giveAttemptBack();
     res.json({ success: true, recoveryKey: newRecoveryKey });
   } catch (error) {
     console.error('Recovery error:', error);

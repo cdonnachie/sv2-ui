@@ -117,6 +117,85 @@ test('recover is rate limited after repeated failures', async () => {
   }
 });
 
+test('wrong attempts sent at once cannot exceed the attempt limit', async () => {
+  const { base, configDir, stop } = await startServer();
+  try {
+    const setup = await fetch(`${base}/api/auth/setup-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'sup3rsecret' }),
+    });
+    assert.equal(setup.status, 200);
+
+    const guesses: Array<[string, Record<string, string>]> = [
+      ['/api/auth/login', { password: 'wrong-guess' }],
+      ['/api/auth/recover', { recoveryKey: 'wrong-guess', newPassword: 'n3wpassword!' }],
+    ];
+    for (const [route, body] of guesses) {
+      const statuses = await Promise.all(
+        Array.from({ length: 12 }, async () => {
+          const res = await fetch(`${base}${route}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          return res.status;
+        }),
+      );
+      // 401 means the guess was verified, 429 that it was refused unverified.
+      assert.equal(statuses.filter((status) => status === 401).length, 5, `${route}: ${statuses.join(' ')}`);
+      assert.equal(statuses.filter((status) => status === 429).length, 7, `${route}: ${statuses.join(' ')}`);
+    }
+  } finally {
+    stop();
+    await rm(configDir, { recursive: true, force: true });
+  }
+});
+
+test('the failed attempts of one client do not lock out another', async () => {
+  const { base, configDir, stop } = await startServer();
+  // Two clients on one machine: the IPv4 and the IPv6 loopback address.
+  const { port } = new URL(base);
+  const attacker = `http://127.0.0.1:${port}`;
+  const operator = `http://[::1]:${port}`;
+  const post = (origin: string, route: string, body: Record<string, unknown>) =>
+    fetch(`${origin}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  try {
+    const setup = await post(operator, '/api/auth/setup-password', { password: 'sup3rsecret' });
+    assert.equal(setup.status, 200);
+    const { recoveryKey } = (await setup.json()) as { recoveryKey: string };
+
+    for (let i = 0; i < 5; i += 1) {
+      assert.equal((await post(attacker, '/api/auth/login', { password: 'wrong-guess' })).status, 401);
+      assert.equal(
+        (await post(attacker, '/api/auth/recover', { recoveryKey: 'wrong-guess', newPassword: 'n3wpassword!' })).status,
+        401,
+      );
+    }
+
+    // The attacker is out of attempts, even with the right credentials.
+    assert.equal((await post(attacker, '/api/auth/login', { password: 'sup3rsecret' })).status, 429);
+    assert.equal(
+      (await post(attacker, '/api/auth/recover', { recoveryKey, newPassword: 'n3wpassword!' })).status,
+      429,
+    );
+
+    // The operator is not.
+    assert.equal((await post(operator, '/api/auth/login', { password: 'sup3rsecret' })).status, 200);
+    assert.equal(
+      (await post(operator, '/api/auth/recover', { recoveryKey, newPassword: 'n3wpassword!' })).status,
+      200,
+    );
+  } finally {
+    stop();
+    await rm(configDir, { recursive: true, force: true });
+  }
+});
+
 test('recover rejects a missing newPassword', async () => {
   const { base, configDir, stop } = await startServer();
   try {
